@@ -8,7 +8,7 @@
 
 - **Board**: LibreSDR Rev.5
 - **SoC**: Zynq-7020 (xc7z020clg400)
-- **RF**: AD9363 (1R1T)
+- **RF**: AD9363 (1R1T) or AD9361 (2R2T)
 - **BOOT Mode**: Hardwired to QSPI (MODE pins pulled on PCB)
 - **No jumpers**: JP1 does not exist on Rev.5
 
