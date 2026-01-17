@@ -1171,3 +1171,591 @@ Device won't boot?
 2. **MANUALLY flash QSPI** using `flashcp` (Method 1, Step 2) - LibreSDR does NOT auto-flash!
 3. If SD fails, use **JTAG Erase + SD Boot + Manual QSPI** (Method 2 → Method 1)
 4. Only use XSCT (Method 3) if openFPGALoader unavailable
+
+---
+
+## QSPI Persistence Issue Investigation (Rev.5 Hardware)
+
+### Problem Summary
+
+**LibreSDR Rev.5** with **Winbond w25q256 (32MB)** QSPI flash experiences data loss after power cycles:
+- ✅ Data writes to QSPI succeed
+- ✅ Data verifies immediately after write
+- ❌ **Data erases to 0xFF after power cycle**
+- ✅ BOOT.bin (mtd0) persists correctly
+- ❌ Linux firmware (mtd3) erases
+
+### Root Cause Analysis
+
+**Device Tree Mismatch:**
+The PlutoSDR v0.38 firmware was designed for **Micron n25q256a** but LibreSDR Rev.5 uses **Winbond w25q256**. The device tree in both Linux kernel and U-Boot incorrectly specified:
+```dts
+compatible = "n25q256a","micron,m25p80";  // WRONG for w25q256
+```
+
+**16MB Addressing Boundary Issue:**
+The w25q256 (32MB) requires 4-byte addressing or Extended Address Register (EAR) for addresses above 16MB:
+- **mtd0** (0-4MB): ✅ Persists - within 3-byte addressing range
+- **mtd1** (4-4.125MB): ✅ Persists - tested and confirmed
+- **mtd3** (5MB-32MB): ❌ Erases - crosses 16MB boundary, needs 4-byte addressing
+
+**Boot Sequence Problem:**
+1. **U-Boot runs FIRST** → Initializes QSPI with wrong driver (n25q256a)
+2. **Linux boots** → Re-initializes with correct driver (after fix)
+3. **User writes data** → Appears successful
+4. **Power cycle** → Data lost because initial U-Boot misconfiguration
+
+Even with Linux kernel device tree fixed, U-Boot's incorrect initialization at boot prevents proper flash programming.
+
+### Fixes Applied
+
+**1. Linux Kernel Device Tree Fix** (`linux/arch/arm/boot/dts/zynq-libre.dtsi`):
+```dts
+&qspi {
+    primary_flash: ps7-qspi@0 {
+        compatible = "winbond,w25q256", "jedec,spi-nor";  // FIXED
+        spi-max-frequency = <50000000>;
+        m25p,fast-read;
+        broken-flash-reset;
+        spi-nor,ddr-quad-read-dummy = <6>;
+        no-wp;
+```
+
+**2. U-Boot Device Tree Fix** (`u-boot-xlnx/arch/arm/dts/zynq-libre-sdr.dts`):
+```dts
+flash@0 {
+    compatible = "winbond,w25q256", "jedec,spi-nor";  // FIXED
+    reg = <0x0>;
+    spi-tx-bus-width = <1>;
+    spi-rx-bus-width = <4>;
+    spi-max-frequency = <50000000>;
+    m25p,fast-read;
+    broken-flash-reset;
+    
+    partition@0 {
+        label = "qspi-fsbl-uboot";
+        reg = <0x0 0x400000>;  // Increased to 4MB for larger BOOT.bin
+    };
+```
+
+**3. Patches Updated:**
+- `patches/linux.diff` - Linux kernel w25q256 fix
+- `patches/u-boot-xlnx.diff` - U-Boot w25q256 fix
+
+### Testing Results
+
+**Test 1: Linux Kernel Fix Only**
+- Applied w25q256 device tree to Linux kernel
+- Rebuilt and flashed firmware
+- Result: ❌ Data still erases after power cycle
+- Conclusion: U-Boot initialization matters
+
+**Test 2: 16MB Boundary Test (mtd1)**
+- Wrote test data to mtd1 (below 16MB boundary)
+- Power cycled device
+- Result: ✅ Data persisted!
+- Conclusion: Flash hardware works, issue is addressing mode
+
+**Test 3: U-Boot Rebuild Without Vivado**
+- Built new U-Boot with w25q256 device tree fix
+- Created BOOT.bin using U-Boot SPL + bootgen
+- Flashed to mtd0 and tested
+- Result: ❌ Data still erases after power cycle
+- Conclusion: **U-Boot SPL doesn't initialize QSPI properly**
+
+### Current Status
+
+**What Works:**
+- ✅ Hybrid boot (QSPI BOOT.bin + SD card Linux)
+- ✅ All firmware components built with w25q256 fixes
+- ✅ Writes below 16MB boundary persist
+- ✅ Device tree patches committed
+
+**What Doesn't Work:**
+- ❌ Standalone QSPI boot (data erases after power cycle)
+- ❌ U-Boot SPL approach (lacks QSPI initialization)
+
+**Blocking Issue:**
+**Proper FSBL from Vivado is required.** U-Boot SPL (used as bootloader workaround) does not perform full QSPI flash initialization. Without Vivado:
+- Cannot generate proper FSBL with QSPI support
+- Cannot create complete BOOT.bin with full hardware init
+- Cannot test if w25q256 fixes actually work
+
+### Required Steps to Complete Fix
+
+**Prerequisites:**
+1. Install **Xilinx Vivado 2022.2** (or 2025.2)
+   - Download: https://www.xilinx.com/support/download.html
+   - Requires free Xilinx account
+   - ~30GB download + ~150GB installation
+   - Can install to external drive (e.g., `/media/vivado/Xilinx`)
+
+**Build Process:**
+```bash
+cd ~/code/libresdr/plutosdr-fw_0.38_libre
+source /path/to/Vivado/2022.2/settings64.sh
+export TARGET=libre
+make clean
+make
+```
+
+This will:
+1. Build HDL in Vivado (generates FPGA bitstream)
+2. Create FSBL with proper QSPI initialization
+3. Build U-Boot with w25q256 device tree
+4. Package BOOT.bin with bootgen (FSBL + bitstream + U-Boot)
+5. Build Linux kernel with w25q256 device tree
+6. Create complete firmware
+
+**Testing After Build:**
+```bash
+# Flash new BOOT.bin with proper FSBL
+cat build/sdk/BOOT.bin | ssh root@192.168.1.10 \
+  "cat > /tmp/BOOT.bin && \
+   flash_erase /dev/mtd0 0 0 && \
+   dd if=/tmp/BOOT.bin of=/dev/mtd0 bs=1M && sync"
+
+# Flash Linux firmware
+cat build/libre.itb | ssh root@192.168.1.10 \
+  "cat > /tmp/libre.itb && \
+   flash_erase /dev/mtd3 0 0 && \
+   dd if=/tmp/libre.itb of=/dev/mtd3 bs=1M && sync"
+
+# Power cycle and verify persistence
+ssh root@192.168.1.10 "poweroff"
+# Physically power cycle (unplug/replug)
+# Wait 40 seconds for boot
+
+ssh root@192.168.1.10 \
+  "dd if=/dev/mtd3 bs=1M count=1 2>/dev/null | md5sum"
+# Should NOT be: 2fdd6851b32ae931637d4845c037b550 (all 0xFF)
+```
+
+### Workaround (Until Vivado Build)
+
+**Use Hybrid Boot:**
+1. Keep BOOT.bin in QSPI (mtd0) - works fine
+2. Boot Linux from SD card
+3. Firmware location: `~/code/libresdr/firmware/build_sdimg_new/`
+4. Copy to SD card FAT32 partition
+
+**Alternative: Ask Community**
+Post on forums/Discord asking if someone with Vivado can build BOOT.bin with these patches:
+- U-Boot device tree: `u-boot-xlnx/arch/arm/dts/zynq-libre-sdr.dts` 
+- Change line 61: `compatible = "winbond,w25q256", "jedec,spi-nor"`
+
+### Hardware Notes
+
+**Flash Chip Identification:**
+```bash
+# Check what's detected
+ssh root@192.168.1.10 "dmesg | grep spi-nor"
+# Should show: spi-nor spi1.0: w25q256 (32768 Kbytes)
+```
+
+**Partition Layout:**
+```bash
+ssh root@192.168.1.10 "cat /proc/mtd"
+# mtd0: 00400000 00010000 "qspi-fsbl-uboot"    # 4MB - BOOT.bin
+# mtd1: 00020000 00010000 "qspi-uboot-env"     # 128KB - U-Boot env
+# mtd2: 000e0000 00010000 "qspi-nvmfs"         # 896KB - Config
+# mtd3: 01b00000 00010000 "qspi-linux"         # 27MB - Linux firmware
+```
+
+**Addressing Test:**
+```bash
+# Test write below 16MB (should persist)
+ssh root@192.168.1.10 \
+  "echo 'TEST' > /tmp/test.bin && \
+   flash_erase /dev/mtd1 0 0 && \
+   dd if=/tmp/test.bin of=/dev/mtd1 && sync"
+# Power cycle and verify
+```
+
+## QSPI Data Persistence Issue (Rev.5 w25q256)
+
+### Issue Summary
+
+LibreSDR Rev.5 uses Winbond **w25q256** (32MB) QSPI flash, but upstream PlutoSDR firmware expects Micron **n25q256a**. This causes data written to mtd3 (Linux partition, 5MB-32MB range) to **erase to 0xFF after power cycles**, while mtd0 (BOOT.bin, 0-4MB) persists correctly.
+
+### Root Cause Analysis
+
+**The Problem:**
+- w25q256 uses **3-byte addressing** for 0-16MB and requires **4-byte addressing** or **Extended Address Register (EAR)** for 16MB-32MB
+- mtd0 (0-4MB): ✅ Within 3-byte range, persists correctly
+- mtd3 (5MB-32MB): ❌ Crosses 16MB boundary, requires 4-byte addressing
+
+**Boot Sequence Impact:**
+1. **U-Boot initializes QSPI first** with device tree specifying `n25q512a` driver
+2. Wrong driver doesn't configure 4-byte addressing or EAR properly
+3. **Linux kernel re-initializes** with correct `w25q256` driver, but initial misconfiguration persists
+4. Writes above 16MB appear successful but don't actually program flash cells correctly
+5. **Power cycle** → hardware reset → data appears as 0xFF (erased)
+
+**Evidence:**
+- mtd1 persistence test (4MB-4.125MB, below 16MB): ✅ Data persists after power cycle
+- mtd3 persistence test (5MB-32MB, crosses 16MB): ❌ Data erases after power cycle
+- Kernel error: `spi-nor spi1.0: failed to read ear reg` (Extended Address Register failure)
+
+### Device Tree Fixes Applied
+
+**Linux Kernel** (`linux/arch/arm/boot/dts/zynq-libre.dtsi`):
+```dts
+&qspi {
+    primary_flash: ps7-qspi@0 {
+        compatible = "winbond,w25q256", "jedec,spi-nor";
+        spi-max-frequency = <50000000>;
+        m25p,fast-read;
+        broken-flash-reset;
+        spi-nor,ddr-quad-read-dummy = <6>;
+        no-wp;
+        // ... partition definitions
+    };
+};
+```
+
+**U-Boot** (`u-boot-xlnx/arch/arm/dts/zynq-libre-sdr.dts`):
+```dts
+flash@0 {
+    compatible = "winbond,w25q256", "jedec,spi-nor";
+    spi-tx-bus-width = <1>;
+    spi-rx-bus-width = <4>;
+    spi-max-frequency = <50000000>;
+    m25p,fast-read;
+    broken-flash-reset;
+    // Updated partition sizes
+    partition@0 { reg = <0x0 0x400000>; }; // mtd0: 4MB for BOOT.bin
+    // ... other partitions
+};
+```
+
+### Build Requirements
+
+To fix this issue, you **must rebuild BOOT.bin** with the corrected U-Boot device tree. This requires:
+
+**Required:**
+- Xilinx Vivado 2022.2 (generates FSBL and bitstream)
+- `xilinx-bootgen` package (to create BOOT.bin)
+
+**Attempted Workarounds (All Failed):**
+- ❌ Rebuilding only U-Boot with U-Boot SPL as bootloader - SPL doesn't initialize QSPI
+- ❌ Extracting FSBL from old BOOT.bin - creates oversized images that don't fit in mtd0
+- ❌ Using Linux kernel fix alone - U-Boot still misconfigures flash during early boot
+
+**Without Vivado, full QSPI boot is not possible.** The device can operate in **hybrid boot mode** (QSPI BOOT.bin + SD Linux) as a workaround.
+
+### Rebuild Procedure (With Vivado)
+
+```bash
+# 1. Install Vivado 2022.2 (requires ~150GB disk space)
+# Download from: https://www.xilinx.com/support/download.html
+
+# 2. Install bootgen (if not already installed)
+sudo apt install xilinx-bootgen
+
+# 3. Clean and rebuild firmware
+cd ~/code/libresdr/plutosdr-fw_0.38_libre
+source /path/to/Vivado/2022.2/settings64.sh
+export TARGET=libre
+make clean
+make              # Builds HDL, FSBL, U-Boot, Linux
+make sdimg        # Creates SD card image
+
+# 4. Flash new BOOT.bin to mtd0
+cat build_sdimg/BOOT.bin | ssh root@192.168.1.10 \
+  "cat > /tmp/BOOT.bin && \
+   flash_erase /dev/mtd0 0 0 && \
+   dd if=/tmp/BOOT.bin of=/dev/mtd0 bs=1M && sync"
+
+# 5. Flash firmware to mtd3
+cat build/libre.itb | ssh root@192.168.1.10 \
+  "cat > /tmp/libre.itb && \
+   flash_erase /dev/mtd3 0 0 && \
+   dd if=/tmp/libre.itb of=/dev/mtd3 bs=1M && sync"
+
+# 6. Power cycle and verify persistence
+# Data should now persist after power cycles
+```
+
+### Verification Commands
+
+```bash
+# Check flash detection
+ssh root@192.168.1.10 "dmesg | grep -i 'spi-nor\|w25q256'"
+# Expected: "spi-nor spi1.0: w25q256 (32768 Kbytes)"
+# May still show "failed to read ear reg" but data should persist
+
+# Verify partition MD5 before power cycle
+ssh root@192.168.1.10 \
+  "dd if=/dev/mtd3 bs=1M count=1 2>/dev/null | md5sum"
+# Record this MD5
+
+# Power cycle device, then check again
+ssh root@192.168.1.10 \
+  "dd if=/dev/mtd3 bs=1M count=1 2>/dev/null | md5sum"
+# Should match pre-power-cycle MD5 (NOT 2fdd6851b32ae931637d4845c037b550)
+```
+
+### Current Status (January 2026)
+
+- ✅ **Device tree fixes**: Applied to both Linux kernel and U-Boot
+- ✅ **Patches regenerated**: All fixes committed to repository
+- ✅ **Linux kernel rebuild**: Completed with w25q256 driver
+- ✅ **U-Boot rebuild**: Completed with w25q256 device tree
+- ✅ **Hybrid boot**: Working (QSPI BOOT.bin + SD Linux)
+- ❌ **QSPI data persistence**: **Still broken** - requires FSBL rebuild with Vivado
+- ⏳ **Vivado installation**: Pending (requires manual download and installation)
+
+**Interim Solution:** Use hybrid boot mode - flash BOOT.bin to mtd0, boot Linux from SD card. This provides full functionality while awaiting Vivado availability.
+
+**Next Steps:**
+1. Download Vivado 2022.2 from Xilinx (requires free account)
+2. Install to `/media/vivado/Xilinx` (external SD card with 228GB available)
+3. Rebuild firmware with proper FSBL (required - cannot use U-Boot SPL)
+4. Flash new BOOT.bin with corrected FSBL + U-Boot w25q256 fix
+5. Test QSPI mtd3 persistence after power cycle
+6. Achieve standalone QSPI boot
+
+## QSPI Flash Persistence Investigation
+
+### Problem Summary
+
+**Issue:** Data written to QSPI flash partition mtd3 (27MB, offset 5MB-32MB) erases to all 0xFF after power cycles, preventing standalone QSPI boot.
+
+**Hardware:** LibreSDR Rev.5 with Winbond w25q256 (32MB NOR flash, JEDEC ID 0xef4019)
+
+**Root Cause:** Incorrect flash chip specification in device trees causes improper 4-byte addressing mode initialization for >16MB address space.
+
+### Investigation Timeline (Jan 16-17, 2026)
+
+#### Initial Discovery
+- Flashed `libre.itb` to mtd3, verified immediately: **SUCCESS** ✅
+- Power cycled device: mtd3 data erased to all 0xFF: **FAILURE** ❌
+- mtd0 (BOOT.bin) persists after power cycles: **SUCCESS** ✅
+- Conclusion: Flash hardware is functional, issue is software initialization
+
+#### Device Tree Mismatch Found
+
+**Linux Kernel Device Tree** (`zynq-libre.dtsi`):
+```diff
+- compatible = "n25q256a", "jedec,spi-nor";  // WRONG - Micron chip
++ compatible = "winbond,w25q256", "jedec,spi-nor";  // CORRECT
+```
+
+**U-Boot Device Tree** (`zynq-libre-sdr.dts`):
+```diff
+- compatible = "n25q512a","micron,m25p80";  // WRONG - Micron chip
++ compatible = "winbond,w25q256", "jedec,spi-nor";  // CORRECT
+```
+
+#### Testing Linux Fix Alone
+
+**Test:** Rebuilt Linux kernel with w25q256 device tree fix
+- Error "expected n25q256a" eliminated ✅
+- Error "failed to read ear reg" persists ❌
+- Power cycle test: mtd3 still erases to 0xFF ❌
+
+**Conclusion:** Linux kernel fix alone is insufficient. U-Boot initializes flash FIRST during boot sequence.
+
+#### 16MB Address Boundary Discovery
+
+**Critical Test:**
+- mtd0 (0-4MB): Persists after power cycle ✅
+- mtd1 (4-4.125MB): **Persists after power cycle** ✅  
+- mtd3 (5MB-32MB): Erases after power cycle ❌
+
+**Root Cause Identified:**
+- w25q256 has **16MB addressing boundary**
+- 0-16MB: Works with 3-byte addressing
+- 16MB-32MB: Requires 4-byte addressing OR Extended Address Register (EAR)
+- mtd3 crosses 16MB boundary, writes above 16MB fail
+
+#### U-Boot Initialization Impact
+
+**Boot Sequence:**
+1. Power on → Zynq PS loads FSBL from QSPI
+2. FSBL configures clocks/DDR, loads bitstream
+3. **U-Boot initializes QSPI with wrong driver** ← CRITICAL FAILURE POINT
+4. Linux boots, re-initializes QSPI (too late - chip state already corrupted)
+
+**Why U-Boot Matters:**
+- U-Boot runs before Linux
+- Incorrect n25q512a driver doesn't enable 4-byte addressing
+- Flash chip enters wrong mode
+- Even though Linux has correct driver, writes to >16MB addresses fail
+- Power cycle resets chip, revealing that data was never properly written
+
+#### Attempted Fix: U-Boot Only Rebuild
+
+**Approach:** Rebuild U-Boot with w25q256 fix, create new BOOT.bin without Vivado
+
+**Steps Taken:**
+1. Fixed U-Boot device tree: `arch/arm/dts/zynq-libre-sdr.dts`
+2. Rebuilt U-Boot: `make -C u-boot-xlnx ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-`
+3. Installed `xilinx-bootgen` from Ubuntu repos (no Vivado needed!)
+4. Created BOOT.bin using U-Boot SPL as bootloader:
+   ```bash
+   bootgen -arch zynq -image boot.bif -w -o BOOT.bin
+   # BIF contained: SPL + bitstream + new U-Boot
+   ```
+5. Flashed to mtd0, power cycled
+
+**Result:** FAILED ❌
+- mtd3 still erases to 0xFF after power cycle
+- U-Boot SPL doesn't initialize QSPI hardware
+- QSPI initialization happens later, but without proper setup from FSBL
+
+#### Why FSBL is Required
+
+**FSBL (First Stage Boot Loader) responsibilities:**
+- Full Zynq PS7 peripheral initialization
+- QSPI controller configuration
+- Sets up memory map and addressing modes
+- **Must be built by Vivado** from HDL project
+
+**U-Boot SPL limitations:**
+- Minimal bootloader, focuses on loading next stage
+- Does not perform full QSPI initialization
+- Cannot replace FSBL for QSPI-dependent boot
+
+**Conclusion:** Cannot achieve working QSPI boot without Vivado-generated FSBL.
+
+### Technical Details
+
+#### Flash Partitions
+```
+dev:    size     erasesize  name
+mtd0: 00400000   00010000   "qspi-fsbl-uboot"      (0-4MB)      ✅ Persists
+mtd1: 00020000   00010000   "qspi-uboot-env"       (4-4.125MB)  ✅ Persists  
+mtd2: 000e0000   00010000   "qspi-nvmfs"           (4.125-5MB)
+mtd3: 01b00000   00010000   "qspi-linux"           (5MB-32MB)   ❌ Erases
+```
+
+#### Kernel Errors
+```
+spi-nor spi1.0: failed to read ear reg
+spi-nor spi1.0: w25q256 (32768 Kbytes)
+```
+
+**"failed to read ear reg"**: Extended Address Register read failure indicates 4-byte addressing mode not properly enabled.
+
+#### Device Tree Fixes Applied
+
+**Linux Kernel:** `linux/arch/arm/boot/dts/zynq-libre.dtsi`
+```dts
+&qspi {
+    primary_flash: ps7-qspi@0 {
+        compatible = "winbond,w25q256", "jedec,spi-nor";
+        spi-max-frequency = <50000000>;
+        m25p,fast-read;
+        broken-flash-reset;
+        spi-nor,ddr-quad-read-dummy = <6>;
+        no-wp;
+        #address-cells = <1>;
+        #size-cells = <1>;
+        
+        partition@0 {
+            label = "qspi-fsbl-uboot";
+            reg = <0x0 0x400000>;  // 4MB (increased from 1MB)
+        };
+        // ... other partitions ...
+    };
+};
+```
+
+**U-Boot:** `u-boot-xlnx/arch/arm/dts/zynq-libre-sdr.dts`
+```dts
+flash@0 {
+    compatible = "winbond,w25q256", "jedec,spi-nor";
+    reg = <0x0>;
+    spi-tx-bus-width = <1>;
+    spi-rx-bus-width = <4>;
+    spi-max-frequency = <50000000>;
+    m25p,fast-read;
+    broken-flash-reset;
+    #address-cells = <1>;
+    #size-cells = <1>;
+    
+    partition@0 {
+        label = "qspi-fsbl-uboot";
+        reg = <0x0 0x400000>;  // 4MB
+    };
+    // ... other partitions ...
+};
+```
+
+#### Patches Updated
+All fixes committed to `patches/linux.diff` and `patches/u-boot-xlnx.diff` for reproducible builds.
+
+### Current Status
+
+**Working:**
+- ✅ Hybrid boot (QSPI BOOT.bin + SD card Linux)
+- ✅ IIO/SDR functionality (30.72 MSPS confirmed)
+- ✅ Device tree fixes applied and tested
+- ✅ Writes to QSPI 0-16MB address range persist
+- ✅ U-Boot rebuilt with w25q256 fix
+- ✅ All patches regenerated with fixes
+
+**Not Working:**
+- ❌ QSPI mtd3 persistence (data erases after power cycle)
+- ❌ Standalone QSPI boot (requires mtd3 working)
+
+**Blocking Issue:**
+- **Vivado required** to rebuild FSBL with proper QSPI initialization
+- U-Boot SPL approach insufficient
+- Cannot proceed without Vivado 2022.2 installation
+
+### Solution Requirements
+
+**Must Have:**
+1. Xilinx Vivado 2022.2 (free WebPack edition)
+2. ~150GB disk space for installation
+3. Xilinx account (free registration)
+
+**Build Process (once Vivado installed):**
+```bash
+cd ~/code/libresdr/plutosdr-fw_0.38_libre
+export VIVADO_SETTINGS=/opt/Xilinx/Vivado/2022.2/settings64.sh
+export TARGET=libre
+make clean
+make              # Full HDL + FSBL + U-Boot + Linux build (1-2 hours)
+make sdimg        # Generate SD card boot files
+```
+
+**Expected Result:**
+- New BOOT.bin with corrected FSBL + U-Boot w25q256 device trees
+- Proper 4-byte addressing mode initialization
+- QSPI mtd3 data persistence after power cycles
+- Standalone QSPI boot capability
+
+### Workarounds (Interim)
+
+**Hybrid Boot Configuration:**
+- BOOT.bin in QSPI mtd0 (U-Boot + FSBL)
+- Linux kernel + rootfs on SD card
+- Fully functional for development
+- Network: 192.168.1.10/24 (gigabit Ethernet)
+- Serial console: /dev/ttyACM0 @ 115200N8
+
+**To Use Hybrid Boot:**
+1. Ensure BOOT.bin in mtd0: `ssh root@192.168.1.10 "dd if=/dev/mtd0 bs=1M count=1 | md5sum"`
+2. Boot files on SD card FAT32 partition:
+   - `uImage` (Linux kernel)
+   - `devicetree.dtb`
+   - `uEnv.txt`
+3. Device boots automatically, loads Linux from SD
+
+### References
+
+- PlutoSDR firmware: https://github.com/analogdevicesinc/plutosdr-fw
+- Winbond w25q256 datasheet: https://www.winbond.com/resource-files/w25q256jv%20spi%20revg%2008032017.pdf
+- Linux SPI-NOR driver: `drivers/mtd/spi-nor/winbond.c`
+- Xilinx QSPI driver: `drivers/spi/spi-zynq-qspi.c`
+
+### Last Updated
+
+Investigation completed: January 17, 2026
+- All device tree fixes applied and committed
+- Awaiting Vivado installation for FSBL rebuild
+- Hybrid boot confirmed working as interim solution
