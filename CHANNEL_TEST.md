@@ -11,7 +11,7 @@ pip install pyadi-iio numpy
 
 ### Running the Test
 ```bash
-cd /home/arsatyants/code/libresdr
+cd /home/<user>/code/libresdr
 python3 test_2t2r_fixed.py
 ```
 
