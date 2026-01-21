@@ -32,7 +32,9 @@ Boot source is controlled by **SOFTWARE ONLY**:
 5. ✅ Flashed mtd3 with libre.itb (14.5MB)
 6. ✅ Device boots in hybrid mode (QSPI + SD)
 
-### Current Boot Configuration (Hybrid Mode)
+### Current Boot Configuration (Hybrid Mode) - **Jan 17, 2026 Status**
+
+**IMPORTANT**: Device is currently using **hybrid boot** configuration:
 
 ```
 Hardware Boot Path:
@@ -43,12 +45,109 @@ U-Boot Decision Tree:
                         → mtd3 ignored even though it's programmed
 
 Result:
-  ✅ BOOT.bin from QSPI mtd0
-  ✅ Linux kernel/rootfs from SD card
-  ❌ mtd3 not used (wasted 14.5MB)
+  ✅ BOOT.bin from QSPI mtd0 (BOOT_w25q256.bin - 4.0MB with U-Boot SPL)
+  ✅ Linux kernel/rootfs from SD card (/dev/mmcblk0p1)
+  ❌ mtd3 not used (contains libre.itb but not accessed)
 ```
 
-**Proof**:
+**Current BOOT.bin in mtd0**:
+- File: `plutosdr-fw_0.38_libre/build/boot_rebuild/BOOT_w25q256.bin`
+- Size: 4.0MB
+- Generated: Jan 17, 2026 04:06
+- MD5: `ed04f7e7e4a1e622a8d54abb3fd02848`
+- Components:
+  - **Bootloader**: U-Boot SPL (72KB from `u-boot-xlnx/spl/boot.bin`)
+  - **Bitstream**: `system_top.bit` (2.2MB - FPGA configuration)
+  - **U-Boot**: `u-boot` (3.0MB - with w25q256 device tree fix)
+- Created with: `bootgen -arch zynq -image boot_spl.bif`
+- **Limitation**: U-Boot SPL does NOT initialize QSPI, proper FSBL from Vivado required
+
+**SD Card Contents** (what U-Boot actually loads):
+- **uImage**: 5.4-5.8MB (Linux kernel from SD)
+- **uramdisk.image.gz**: 7.4MB (root filesystem ramdisk from SD)
+- **devicetree.dtb**: 22KB (device tree from SD)
+- **uEnv.txt**: U-Boot environment configuration
+
+**QSPI mtd3 Status**:
+- Contains: libre.itb (15MB FIT image with kernel+dtb+rootfs)
+- **NOT USED**: U-Boot loads from SD card instead
+- Erases after power cycle (w25q256 4-byte addressing not initialized by SPL)
+
+**To achieve standalone QSPI boot**: Need Vivado to rebuild BOOT.bin with proper FSBL that initializes QSPI correctly.
+
+---
+
+## Understanding w25q256 Flash Chip and 16MB Addressing Boundary
+
+### Why w25q256 is 32MB but has 16MB addressing limitation
+
+The w25q256 is a **32MB chip** (256 Megabits = 32 Megabytes), not 16MB:
+
+**Chip Specifications:**
+- **Total capacity**: 32MB (0x00000000 - 0x01FFFFFF)
+- **Full address range**: 0 to 33,554,432 bytes
+
+**Addressing Modes:**
+- **3-byte addressing mode** (default after power-on): Can only access 0-16MB (2^24 = 16,777,216 bytes)
+- **4-byte addressing mode**: Required to access full 0-32MB range (2^25 bytes)
+- **Extended Address Register (EAR)**: Alternative method to access upper 16MB
+
+### Why Correct Device Tree Driver Matters
+
+**w25q256 driver (CORRECT)**:
+- Understands chip requires 4-byte addressing for >16MB
+- Automatically enables 4-byte mode or uses EAR
+- Properly initializes flash controller
+
+**n25q512a driver (WRONG - 64MB Micron chip)**:
+- Different command set and initialization sequence
+- Doesn't enable 4-byte addressing for w25q256
+- Leaves chip in default 3-byte mode
+- Upper 16MB remains inaccessible
+
+### MTD Partitions vs Addressing Modes
+
+```
+Partition Layout on 32MB w25q256:
+
+mtd0: 0x000000-0x400000 (0-4MB)       ← 3-byte addressing works ✅
+mtd1: 0x400000-0x420000 (4-4.125MB)   ← 3-byte addressing works ✅  
+mtd2: 0x420000-0x500000 (4.125-5MB)   ← 3-byte addressing works ✅
+                                        ────── 16MB BOUNDARY ──────
+mtd3: 0x500000-0x2000000 (5MB-32MB)   ← Crosses 16MB! Requires 4-byte mode ❌
+```
+
+### Test Results Confirm the Issue
+
+**Persistence Tests (Jan 16-17, 2026)**:
+- ✅ **mtd0 (0-4MB)**: Data persists after power cycle
+- ✅ **mtd1 (4-4.125MB)**: Test data "TEST_DATA_12345" persists after power cycle
+- ❌ **mtd3 (5-32MB)**: Data erases to 0xFF after power cycle
+
+**Why mtd3 fails**:
+1. Writes to mtd3 appear successful (verify passes immediately)
+2. Data actually written to addresses >16MB
+3. Chip not in 4-byte addressing mode (FSBL didn't initialize it)
+4. Power cycle resets chip to default 3-byte mode
+5. Previous writes to >16MB addresses effectively "disappear"
+6. Reading back shows all 0xFF (erased state)
+
+**Proof flash hardware works**: mtd0 and mtd1 persist correctly, proving the Winbond w25q256 chip itself is functional.
+
+### Solution
+
+**Proper FSBL from Vivado** must:
+1. Initialize QSPI controller
+2. Detect w25q256 flash chip
+3. Enable 4-byte addressing mode OR configure EAR
+4. Pass initialized state to U-Boot
+5. U-Boot maintains 4-byte mode for Linux
+
+**Current limitation**: U-Boot SPL (used in BOOT_w25q256.bin) does NOT perform this initialization.
+
+---
+
+### Proof Device Currently Using Hybrid Boot
 ```bash
 $ ssh root@192.168.1.10 'cat /proc/mtd'
 mtd0: 00400000  "qspi-fsbl-uboot"    ← Your BOOT.bin here
