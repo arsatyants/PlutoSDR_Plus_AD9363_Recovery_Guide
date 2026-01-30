@@ -98,6 +98,437 @@ Output rate: 7.68 MSPS or 30.72 MSPS
 - 18× DSP48E1 slices (hardware multipliers)
 - Block RAM for filter coefficients
 
+---
+
+## Complete Signal Chain - Detailed Explanation
+
+### RX Path (Antenna → Software)
+
+```
+AD9361 Chip → LVDS Interface → axi_ad9361 → rx_fir_decimator → cpack → DMA → DDR3 RAM → libiio → Software
+   (RF)      (12 diff pairs)   (Deserialize)   (Filter I0/Q0)  (Pack)  (Transfer) (Memory) (Driver) (App)
+```
+
+#### **Block 1: AD9361 RF Transceiver (Hardware Chip)**
+
+**Function:** Converts RF signal to digital samples
+
+**Process:**
+1. **LNA (Low Noise Amplifier):** Amplifies weak RF signal (e.g., -90 dBm to -20 dBm)
+2. **Mixer:** Down-converts RF (e.g., 2.4 GHz) to baseband I/Q (DC-centered)
+3. **ADC (12-bit, up to 61.44 MSPS):** Digitizes I and Q for two channels
+4. **Digital filters:** Half-band filters, decimation
+5. **LVDS serializer:** Converts parallel data to 6 differential pairs
+
+**Output:** 
+- RX_CLK (clock ~246 MHz DDR = 123 MHz sample clock)
+- RX_FRAME (marks I/Q boundaries)
+- RX_DATA[5:0] (6 LVDS data lanes, 12 bits per sample DDR)
+
+**Configuration:**
+- Mode: 2T2R (2 transmit, 2 receive channels)
+- Interface: LVDS (Low Voltage Differential Signaling)
+- Sample rate: Software configurable 2.5-61.44 MSPS
+
+---
+
+#### **Block 2: axi_ad9361 (FPGA IP Core)**
+
+**Location:** Programmable Logic (FPGA fabric)
+
+**Function:** LVDS deserializer, clock recovery, parallel data interface
+
+**Sub-blocks:**
+
+##### a. **LVDS Receiver (rx_clk_in, rx_frame_in, rx_data_in)**
+```verilog
+// Converts differential signals to single-ended
+IBUFDS_DIFF_OUT rx_clk_ibuf (.I(rx_clk_in_p), .IB(rx_clk_in_n), .O(rx_clk));
+```
+
+##### b. **IDELAY2 (Input Delay Calibration)**
+- **Purpose:** Compensates for PCB trace length differences
+- **Control:** `delay_clk` (200 MHz) provides delay tap resolution (~78 ps)
+- **Configuration:** `CONFIG.ADC_INIT_DELAY 30` = 30 taps × 78 ps = 2.34 ns delay
+- **Why needed:** LVDS lanes arrive with different skew due to PCB routing
+
+##### c. **Deserializer (DDR → SDR)**
+```
+Input:  246 MHz DDR (rising+falling edges) = 492 Mbps per lane
+Output: 123 MHz SDR (single edge) = 16-bit words
+```
+
+##### d. **Clock Recovery & Frame Alignment**
+- Uses `rx_frame_in` to identify I/Q sample boundaries
+- Aligns all 6 data lanes to same clock phase
+- Generates `adc_valid_i0`, `adc_valid_q0` strobes
+
+##### e. **Data Path Output (per channel)**
+```
+adc_data_i0[15:0]   - In-phase samples, channel 0 (16-bit signed)
+adc_data_q0[15:0]   - Quadrature samples, channel 0
+adc_data_i1[15:0]   - In-phase samples, channel 1
+adc_data_q1[15:0]   - Quadrature samples, channel 1
+adc_valid_i0        - Data valid strobe
+adc_enable_i0       - Channel enable control
+```
+
+##### f. **AXI4-Lite Register Interface**
+- Base address: `0x79020000`
+- Software can read/write AD9361 SPI registers
+- Control: gain, frequency, sample rate, filter bandwidth
+- Status: RSSI, temperature, calibration state
+
+**Clock Domain:** 
+- Input: LVDS clock (from AD9361)
+- Output: `l_clk` (internal logic clock, same freq as LVDS clock)
+
+**FPGA Resources:**
+- 6× IBUFDS (differential input buffers)
+- 6× IDELAYE2 (programmable delay elements)
+- 6× IDDR (DDR-to-SDR converters)
+- ~3,000 LUTs (state machines, alignment logic)
+- ~2,000 FFs (pipeline registers)
+
+---
+
+#### **Block 3: rx_fir_decimator (FIR Filter + Decimation)**
+
+**Location:** Programmable Logic
+
+**Function:** Reduces sample rate while improving SNR
+
+**Why Decimation?**
+- AD9361 might output 61.44 MSPS
+- User wants 7.68 MSPS (8× less data)
+- Gigabit Ethernet can't handle 4 channels × 32-bit × 61.44 MSPS = 7.86 Gbps
+- Decimation: 61.44 MSPS ÷ 8 = 7.68 MSPS → 984 Mbps (fits in Gigabit Ethernet)
+
+**Filter Stages:**
+
+##### Stage 1: Halfband Filter (HB1)
+- Taps: 47
+- Decimation: 2:1
+- Passband: 0 to 0.4 × Fs
+- Stopband: 0.6 × Fs to Nyquist
+
+##### Stage 2: Halfband Filter (HB2)
+- Taps: 47
+- Decimation: 2:1
+- Cascades with HB1 for 4× total
+
+##### Stage 3: Halfband Filter (HB3)
+- Taps: 35
+- Decimation: 2:1
+- Total decimation: 8:1
+
+**Data Flow:**
+```
+Input:  adc_data_i0[15:0] @ 61.44 MSPS
+        ↓ [HB1 @ 2:1]
+        @ 30.72 MSPS
+        ↓ [HB2 @ 2:1]
+        @ 15.36 MSPS
+        ↓ [HB3 @ 2:1]
+Output: data_out_0[15:0] @ 7.68 MSPS
+```
+
+**Connections (from system_bd.tcl):**
+```tcl
+ad_connect axi_ad9361/adc_data_i0 rx_fir_decimator/data_in_0
+ad_connect axi_ad9361/adc_valid_i0 rx_fir_decimator/valid_in_0
+ad_connect rx_fir_decimator/data_out_0 cpack/fifo_wr_data_0
+ad_connect rx_fir_decimator/valid_out_0 cpack/fifo_wr_en
+```
+
+**Control:**
+- Software sets decimation ratio via `decim_slice` (xlslice IP)
+- Can be bypassed (1:1) or set to 2, 4, or 8
+- Controlled via AXI register bit in `axi_ad9361/up_adc_gpio_out`
+
+**FPGA Resources:**
+- ~6,000 LUTs (filter logic + control)
+- 36× DSP48E1 (hardware multipliers for filter taps)
+- 4× BRAM (coefficient storage)
+
+---
+
+#### **Block 4: cpack (util_cpack2 - Channel Packer)**
+
+**Location:** Programmable Logic
+
+**Function:** Combines 4 separate data streams (I0, Q0, I1, Q1) into single AXI Stream
+
+**Why Needed?**
+- DMA engine expects single data stream
+- But we have 4 channels: I0, Q0, I1, Q1
+- Must interleave samples: I0[n], Q0[n], I1[n], Q1[n], I0[n+1], ...
+
+**Data Flow:**
+```
+Input channels:
+  fifo_wr_data_0[15:0]  ← rx_fir_decimator/data_out_0 (I0)
+  fifo_wr_data_1[15:0]  ← rx_fir_decimator/data_out_1 (Q0)
+  fifo_wr_data_2[15:0]  ← axi_ad9361/adc_data_i1 (I1, no filter)
+  fifo_wr_data_3[15:0]  ← axi_ad9361/adc_data_q1 (Q1, no filter)
+
+Output:
+  packed_fifo_wr[63:0] = {Q1[15:0], I1[15:0], Q0[15:0], I0[15:0]}
+  packed_fifo_wr_en    = Data valid strobe
+```
+
+**Note on LibreSDR Channel Processing:**
+- **Channel 0 (I0/Q0):** Goes through FIR decimator (filtered)
+- **Channel 1 (I1/Q1):** Bypasses FIR (direct from AD9361)
+  - This is intentional - channel 1 runs at full rate for certain applications
+  - User can enable/disable channels independently
+
+**Connections:**
+```tcl
+# Channel 0: Filtered path
+ad_connect cpack/fifo_wr_data_0 rx_fir_decimator/data_out_0  (I0)
+ad_connect cpack/fifo_wr_data_1 rx_fir_decimator/data_out_1  (Q0)
+
+# Channel 1: Direct path
+ad_connect cpack/fifo_wr_data_2 axi_ad9361/adc_data_i1       (I1)
+ad_connect cpack/fifo_wr_data_3 axi_ad9361/adc_data_q1       (Q1)
+```
+
+**FPGA Resources:**
+- ~800 LUTs (packing logic)
+- ~600 FFs (FIFO control)
+- Small FIFO (512 samples) to handle clock domain crossing
+
+---
+
+#### **Block 5: axi_ad9361_adc_dma (DMA Controller)**
+
+**Location:** Programmable Logic
+
+**Function:** Transfers packed samples from FPGA to DDR3 RAM without CPU involvement
+
+**Configuration:**
+```tcl
+CONFIG.DMA_TYPE_SRC 2         # Source = AXI Stream (from cpack)
+CONFIG.DMA_TYPE_DEST 0        # Destination = AXI4 Memory-Mapped (DDR3)
+CONFIG.CYCLIC 0               # Non-cyclic (streaming mode)
+CONFIG.DMA_DATA_WIDTH_SRC 64  # 64-bit samples (4× 16-bit channels)
+```
+
+**Operation:**
+
+##### 1. **Descriptor Setup (Software)**
+```c
+// Linux driver sets up transfer
+dma_addr = 0x1E000000;  // Physical DDR3 address
+dma_length = 1048576;   // 1 MB buffer
+dma_start();
+```
+
+##### 2. **Hardware Transfer (Autonomous)**
+```
+Clock cycle 0:   cpack outputs packed_fifo_wr[63:0] = {Q1, I1, Q0, I0}
+Clock cycle 1:   DMA stores to DDR3[0x1E000000] ← {Q1, I1, Q0, I0}
+Clock cycle 2:   cpack outputs next sample
+Clock cycle 3:   DMA stores to DDR3[0x1E000008] ← next sample
+...
+Clock cycle N:   Transfer complete, interrupt to ARM CPU
+```
+
+**Memory Bandwidth:**
+- Sample rate: 7.68 MSPS (after decimation)
+- Data width: 64 bits = 8 bytes per sample
+- Bandwidth: 7.68M × 8 = 61.44 MB/s per second
+- DDR3 bandwidth: 4.2 GB/s (plenty of headroom)
+
+**AXI4 Interface:**
+- Master port: 64-bit data, burst transfers
+- Connects to PS7 HP0 (High Performance port 0)
+- Can burst up to 256 beats (2 KB per burst)
+
+**FPGA Resources:**
+- ~1,500 LUTs (state machine, address generation)
+- ~2,000 FFs (AXI interface registers)
+- No DSP or BRAM (pure control logic)
+
+---
+
+#### **Block 6: DDR3 RAM (PS Side)**
+
+**Location:** Processing System hardware (not reprogrammable)
+
+**Function:** Temporary storage for sample buffers
+
+**Memory Map:**
+```
+0x00000000 - 0x3FFFFFFF: Full 1 GB DDR3 address space
+0x00000000 - 0x00100000: Linux kernel (1 MB)
+0x00100000 - 0x10000000: User space (256 MB)
+0x10000000 - 0x20000000: Reserved (256 MB)
+0x1E000000 - 0x20000000: DMA buffers (32 MB typical)
+```
+
+**Circular Buffer Scheme:**
+```
+Buffer 0: [0x1E000000 - 0x1E100000]  (1 MB)
+Buffer 1: [0x1E100000 - 0x1E200000]  (1 MB)
+Buffer 2: [0x1E200000 - 0x1E300000]  (1 MB)
+Buffer 3: [0x1E300000 - 0x1E400000]  (1 MB)
+
+DMA fills buffer while CPU reads previous buffer
+```
+
+---
+
+#### **Block 7: libiio Kernel Driver**
+
+**Location:** Linux kernel space
+
+**Function:** Manages DMA, exposes samples to userspace via IIO subsystem
+
+**Key Components:**
+
+##### a. **IIO Device (`/dev/iio:device0`)**
+- Character device for sample streaming
+- Supports `read()` syscall for zero-copy access
+- Provides mmap() for direct buffer access
+
+##### b. **IIO Buffers (`/dev/iio:device0:buffer0`)**
+```bash
+# Enable buffer
+echo 1 > /sys/bus/iio/devices/iio:device0/scan_elements/in_voltage0_i_en
+echo 1 > /sys/bus/iio/devices/iio:device0/scan_elements/in_voltage0_q_en
+echo 1 > /sys/bus/iio/devices/iio:device0/buffer/enable
+
+# Read samples
+cat /dev/iio:device0:buffer0 > samples.bin
+```
+
+##### c. **Network Backend (iiod daemon)**
+```
+Local:    libiio → /dev/iio:device0 → DMA buffers
+Network:  libiio → TCP:30431 → iiod → /dev/iio:device0 → DMA
+```
+
+**Data Format in Kernel:**
+```c
+struct iio_sample {
+    int16_t i0;  // In-phase, channel 0
+    int16_t q0;  // Quadrature, channel 0
+    int16_t i1;  // In-phase, channel 1
+    int16_t q1;  // Quadrature, channel 1
+} __attribute__((packed));
+```
+
+---
+
+#### **Block 8: Userspace Application**
+
+**Function:** Consumes samples via libiio API
+
+**Example (Python with pylibiio):**
+```python
+import iio
+
+# Connect to device
+ctx = iio.Context('ip:192.168.1.10')
+dev = ctx.find_device('cf-ad9361-lpc')
+
+# Configure channels
+rx0_i = dev.find_channel('voltage0_i', is_output=False)
+rx0_q = dev.find_channel('voltage0_q', is_output=False)
+rx0_i.enabled = True
+rx0_q.enabled = True
+
+# Create buffer
+buffer = iio.Buffer(dev, 16384)  # 16K samples
+
+# Read samples
+while True:
+    buffer.refill()
+    data = buffer.read()  # Raw bytes
+    # Process I/Q samples...
+```
+
+---
+
+### TX Path (Software → Antenna)
+
+```
+Software → libiio → DDR3 RAM → DMA → tx_upack → tx_fir_interpolator → axi_ad9361 → LVDS → AD9361 → RF
+  (App)   (Driver)  (Memory)  (Transfer) (Unpack)  (Upsample 8×)     (Serialize)  (12 diff)  (DAC) (Antenna)
+```
+
+#### **TX Block 1: tx_upack (util_upack2 - Channel Unpacker)**
+
+**Function:** Separates packed stream from DMA into 4 channels
+
+**Data Flow:**
+```
+Input from DMA:
+  s_axis[63:0] = {Q1[15:0], I1[15:0], Q0[15:0], I0[15:0]}
+
+Output channels:
+  fifo_rd_data_0[15:0] → tx_fir_interpolator/data_in_0 (I0)
+  fifo_rd_data_1[15:0] → tx_fir_interpolator/data_in_1 (Q0)
+  fifo_rd_data_2[15:0] → axi_ad9361/dac_data_i1 (I1, direct)
+  fifo_rd_data_3[15:0] → axi_ad9361/dac_data_q1 (Q1, direct)
+```
+
+**Note:** Same asymmetry as RX - channel 0 interpolated, channel 1 direct
+
+---
+
+#### **TX Block 2: tx_fir_interpolator (FIR Interpolation Filter)**
+
+**Function:** Upsamples from low rate (7.68 MSPS) to AD9361 rate (61.44 MSPS)
+
+**Why Interpolation?**
+- Software generates samples at low rate (less CPU usage)
+- AD9361 DAC needs high sample rate for wide bandwidth
+- Interpolator inserts zeros + filters = smooth upsampling
+
+**Stages:**
+```
+Input:  7.68 MSPS
+        ↓ [Zero-insert + HB1] × 2
+        15.36 MSPS
+        ↓ [Zero-insert + HB2] × 2
+        30.72 MSPS
+        ↓ [Zero-insert + HB3] × 2
+Output: 61.44 MSPS
+```
+
+**Filter Characteristics:**
+- Same as RX decimator, but time-reversed
+- Removes imaging artifacts from zero-insertion
+- Maintains signal quality
+
+---
+
+#### **TX Block 3: axi_ad9361 (DAC Path)**
+
+**Function:** Serializes parallel data to LVDS for AD9361
+
+**Process:**
+1. Receives `dac_data_i0[15:0]`, `dac_data_q0[15:0]` etc.
+2. Converts SDR → DDR (double data rate)
+3. Serializes to 6 LVDS lanes
+4. Outputs `tx_data_out_p/n[5:0]`, `tx_clk_out_p/n`, `tx_frame_out_p/n`
+
+---
+
+#### **TX Block 4: AD9361 DAC**
+
+**Function:** Converts digital samples to RF
+
+**Process:**
+1. **LVDS deserializer:** Recovers 12-bit samples from 6 lanes
+2. **DAC (12-bit, up to 61.44 MSPS):** Digital-to-analog conversion
+3. **Digital filters:** Interpolation, half-band filters
+4. **Mixer:** Up-converts baseband I/Q to RF frequency
+5. **PA (Power Amplifier):** Amplifies to output power (+0 dBm typ)
+
 ### 4. **FIR Filter - TX Interpolator (`tx_fir_interpolator`)**
 
 **Purpose:** Digital upconversion (increases sample rate for transmission)
@@ -464,3 +895,47 @@ At 200 MHz clock, you have **10 clock cycles** per sample for processing.
 4. **Protocol offload:** Decode packets while ARM handles network
 
 The Zynq 7020 is a perfect fit for LibreSDR - enough resources for AD9361 interface + significant headroom for custom signal processing!
+
+---
+
+## Signal Chain Timing & Latency Analysis
+
+### RX Path Total Latency (Antenna → Software)
+
+| Stage | Latency | Description |
+|-------|---------|-------------|
+| **AD9361 RF → ADC** | 500 ns | LNA + Mixer + ADC pipeline |
+| **AD9361 Digital Filters** | 2.1 μs | 128-tap FIR decimator @ 61.44 MSPS |
+| **LVDS Transmission** | 8 ns | PCB trace (20 cm @ 15 cm/ns) |
+| **axi_ad9361 Deserializer** | 40 ns | IDELAY + clock recovery (5 clocks @ 123 MHz) |
+| **rx_fir_decimator** | 1.7 μs | 129 taps @ 61.44 MSPS input |
+| **cpack Buffer** | 65 ns | 8-sample FIFO @ 123 MHz |
+| **DMA Transfer** | 200 ns | AXI4 burst write to DDR3 |
+| **DDR3 Write** | 50 ns | Write latency |
+| **CPU Cache Fetch** | 100 ns | ARM reads DMA buffer |
+| **TOTAL (HW only)** | **~4.8 μs** | From antenna to DDR3 RAM |
+
+### TX Path Total Latency (Software → Antenna)
+
+| Stage | Latency | Description |
+|-------|---------|-------------|
+| **Software → DDR3** | 100 ns | memcpy() to DMA buffer |
+| **DMA Read** | 200 ns | AXI4 burst read from DDR3 |
+| **tx_upack** | 40 ns | Unpacking logic |
+| **tx_fir_interpolator** | 680 ns | 129 taps @ 7.68 MSPS input |
+| **axi_ad9361 Serializer** | 40 ns | Parallel → DDR → LVDS |
+| **LVDS Transmission** | 8 ns | PCB trace |
+| **AD9361 Digital Filters** | 2.1 μs | 128-tap interpolator |
+| **AD9361 DAC → RF** | 500 ns | Mixer + PA delay |
+| **TOTAL (HW only)** | **~3.7 μs** | From DDR3 to antenna |
+
+### Clock Domains Reference
+
+| Clock | Frequency | Source | Purpose |
+|-------|-----------|--------|---------|
+| sys_cpu_clk | 100 MHz | PS7 FCLK_CLK0 | AXI control bus |
+| sys_200m_clk | 200 MHz | PS7 FCLK_CLK1 | IDELAY calibration |
+| l_clk | 122.88 MHz | AD9361 LVDS | Data path (RX/TX) |
+| ARM CPU | 750 MHz | PS7 ARM PLL | Cortex-A9 cores |
+| DDR3 | 525 MHz | PS7 DDR PLL | Memory controller |
+
